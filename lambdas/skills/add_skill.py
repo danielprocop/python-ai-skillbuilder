@@ -20,8 +20,8 @@ def lambda_handler(event, context):
 
     skill = {
         "Skill_UID": str(uuid.uuid4()), 
-        "user": body.get["user"],
-        "skillName": body.get['skillName'],
+        "user": body["user"],
+        "skill": body['skill'],
         "level": body.get("level", 1),
         "acquired_on": date.today().strftime("%d/%m/%Y")
     }
