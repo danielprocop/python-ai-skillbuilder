@@ -10,6 +10,7 @@ dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(TABLE_NAME)
 
 def lambda_handler(event, context):
+    logger(event)
     skill_id = event["pathParameters"]["id"]
     logger.info(f"Fetching skill with ID: {skill_id}")
 
@@ -19,10 +20,11 @@ def lambda_handler(event, context):
     if item:
         return {
             "statusCode": 200,
-            "body": json.dumps(item)
+            "body": json.dumps(item, default=str)
         }
     else:
         return {
             "statusCode": 404,
             "body": json.dumps({"message": "Skill not found"})
         }
+
