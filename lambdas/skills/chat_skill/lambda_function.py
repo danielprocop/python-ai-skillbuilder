@@ -1,180 +1,176 @@
-import os
 import json
+import os
+import uuid
 from datetime import datetime
-from google import genai
-import boto3  # usato se salvi su DynamoDB; boto3 è incluso nel runtime
-# Se usi RDS/SQL, importa qui psycopg2 o SQLAlchemy
+import logging
 
-# Inizializza client Gemini una sola volta (fuori dall'handler per riuso in esecuzioni successive calde)
-GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY")
-# Modello da usare (scegli in base a quanto è disponibile nel tuo account free tier)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+import boto3
+from botocore.exceptions import ClientError
+from google import genai  # assicurati di avere google-genai in requirements
 
-# Configura client Google Gen AI
-if not GEMINI_API_KEY:
-    raise RuntimeError("Manca GOOGLE_API_KEY nelle variabili d'ambiente")
-try:
-    client = genai.Client(api_key=GEMINI_API_KEY)
-except Exception as e:
-    # In fase di deploy, se Google Gen AI SDK non è incluso correttamente, si fallirà qui
-    raise
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-# Configura DB: ad esempio DynamoDB
-DYNAMO_TABLE = os.getenv("SKILLS_TABLE")  # nome tabella inserito in env vars
+# Configurazione DynamoDB
+TABLE_NAME = os.getenv("DYNAMODB_TABLE", "skillbuilder-skills")
 dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table(DYNAMO_TABLE)
+table = dynamodb.Table(TABLE_NAME)
+
+# Configurazione Gemini
+API_KEY = os.getenv("GOOGLE_API_KEY")
+if not API_KEY:
+    logger.error("GOOGLE_API_KEY non impostata")
+    # Falla subito se vuoi, oppure continua ma senza AI
+    # raise RuntimeError("GOOGLE_API_KEY mancante")
+try:
+    gemini_client = genai.Client(api_key=API_KEY)
+except Exception as e:
+    logger.error("Errore inizializzazione Gemini client: %s", str(e))
+    gemini_client = None
+
+# Modello gemini
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 def lambda_handler(event, context):
     """
-    handler per chat-skill: esegue parsing del messaggio libero, chiama Gemini per estrarre skill,
-    e salva ogni skill nel DB DynamoDB.
-    Ci si aspetta evento API Gateway proxy integration:
-    event["body"] è stringa JSON con almeno {"userId": "...", "message": "..."}.
+    Handler per 'chat skill': riceve { "user": "...", "message": "..." }
+    Ritorna: 
+      - statusCode 200 con JSON { added: [...], message: "...", aiRaw: {...} }
+      - statusCode 400/500 in caso di errori.
     """
+    logger.info("chat_skill invoked, event: %s", event)
+
+    # Estraggo body JSON
+    body_str = event.get("body", "{}")
     try:
-        # 1. Verifica metodo HTTP: accettiamo solo POST
-        http_method = event.get("httpMethod")
-        if http_method != "POST":
-            return {
-                "statusCode": 405,
-                "headers": {"Content-Type": "application/json"},
-                "body": json.dumps({"error": "Metodo non consentito, usa POST"})
-            }
-        # 2. Leggi e parsa body JSON
-        body_str = event.get("body")
-        if not body_str:
-            raise ValueError("Body mancante")
-        try:
-            body = json.loads(body_str)
-        except json.JSONDecodeError:
-            raise ValueError("JSON non valido nel body")
-        # 3. Estrai userId e message
-        user_id = body.get("userId") or body.get("user_id")
-        message_text = body.get("message")
-        if not user_id or not message_text:
-            raise ValueError("Campi 'userId' e 'message' richiesti")
-        # 4. Costruisci prompt per Gemini
-        # Per la data odierna in ISO, nel fuso server (si può migliorare includendo fuso Europe/Rome se necessario)
-        today_iso = datetime.utcnow().strftime("%Y-%m-%d")
-        prompt = (
-            "Sei un assistente in italiano. Ricevi un messaggio utente e devi estrarre se contiene informazioni "
-            "su una o più skill apprese. Se trovi una o più skill, restituisci solo un JSON valido (array) in questo formato:\n"
-            "[\n"
-            '  { "skill": "nome", "level": 1, "description": "...", "date": "YYYY-MM-DD" },\n'
-            "  ...\n"
-            "]\n"
-            "Campi opzionali (level, description, date) ometti o usa null se non presenti. Se date non specificata, usa la data odierna.\n"
-            "Se l'utente menziona più skill, usa un array con più oggetti. Se nessuna skill, restituisci un array vuoto: [].\n"
-            "Rispondi in italiano e NON inviare testo extra oltre al JSON puro.\n"
-            f"Data odierna: {today_iso}.\n"
-            f"Esempi:\n"
-            "- “Oggi ho imparato React e Redux” → `[{{\"skill\":\"React\"}},{{\"skill\":\"Redux\"}}]`\n"
-            "- “Ho migliorato Python, livello 7, scrivendo script di automazione” → `[{{\"skill\":\"Python\",\"level\":7,\"description\":\"scrivendo script di automazione\",\"date\":\"{today_iso}\"}}]`\n"
-            f"Messaggio utente: \"{message_text}\""
-        )
-        # 5. Chiamata a Gemini via SDK
-        # Usiamo chat.create per generare risposta; si può anche usare client.models.generate_content
-        # Qui esempio con chat API:
-        chat = client.chats.create(model=GEMINI_MODEL)
-        response = chat.send_message(prompt)
-        raw_text = response.text.strip()
-        # 6. Parsing del JSON restituito
-        try:
-            skill_array = json.loads(raw_text)
-            if not isinstance(skill_array, list):
-                # Se non è array, trattiamo come zero risultati
-                skill_array = []
-        except json.JSONDecodeError:
-            # Se non parseabile, consideriamo che non abbia trovato skill
-            skill_array = []
-        # 7. Per ciascuna skill estratta, salviamo in DB
-        saved_items = []
-        for item in skill_array:
-            # Ogni item dovrebbe essere un dict con almeno "skill"
-            name = item.get("skill")
-            if not name or not isinstance(name, str):
-                continue
-            name = name.strip()
-            if not name:
-                continue
-            # Livello opzionale
-            level = item.get("level")
-            if level is not None:
-                try:
-                    level = int(level)
-                    if not (1 <= level <= 10):
-                        level = None
-                except:
-                    level = None
-            # Descrizione opzionale
-            description = item.get("description")
-            if description is not None:
-                description = description.strip()
-                # Facoltativo: tronca se troppo lunga
-                if len(description) > 500:
-                    description = description[:500]
-            # Data opzionale
-            date_str = item.get("date")
-            # Verifica formato YYYY-MM-DD
-            try:
-                # Se non fornita o formato errato, usiamo today_iso
-                if isinstance(date_str, str):
-                    # semplice validazione: lunghezza 10 e caratteri
-                    parts = date_str.split("-")
-                    if len(parts) == 3 and len(parts[0])==4:
-                        learned_date = date_str
-                    else:
-                        learned_date = today_iso
-                else:
-                    learned_date = today_iso
-            except:
-                learned_date = today_iso
-            # Costruisci item DynamoDB simile a add_skill
-            import uuid
-            skill_id = str(uuid.uuid4())
-            db_item = {
-                "userId": str(user_id),
-                "skillId": skill_id,
-                "skillName": name,
-                "learnedDate": learned_date
-            }
-            if level is not None:
-                db_item["level"] = level
-            if description:
-                db_item["description"] = description
-            # Salva su DynamoDB
-            try:
-                table.put_item(Item=db_item)
-                saved_items.append(db_item)
-            except Exception as e:
-                # Log dell’errore ma continua con le altre
-                print(f"Errore salvataggio skill {name}: {e}")
-        # 8. Costruisci messaggio di risposta
-        if saved_items:
-            names = ", ".join([item["skillName"] for item in saved_items])
-            ai_message = f"Ho salvato la/le skill: {names}."
-        else:
-            ai_message = "Non ho individuato alcuna skill nel tuo messaggio. Puoi specificare cosa hai imparato?"
-        # 9. Ritorna risposta HTTP
-        return {
-            "statusCode": 200,
-            "headers": {"Content-Type": "application/json"},
-            "body": json.dumps({
-                "aiMessage": ai_message,
-                "savedSkills": saved_items
-            })
-        }
-    except ValueError as ve:
-        # Errori di validazione input
+        body = json.loads(body_str)
+    except json.JSONDecodeError:
         return {
             "statusCode": 400,
-            "headers": {"Content-Type": "application/json"},
-            "body": json.dumps({"error": str(ve)})
+            "body": json.dumps({"error": "Body non è JSON valido"})
         }
-    except Exception as e:
-        print("Errore in chat_skill:", str(e))
+
+    user = body.get("user")
+    message = body.get("message")
+    if not user or not isinstance(message, str) or not message.strip():
         return {
-            "statusCode": 500,
-            "headers": {"Content-Type": "application/json"},
-            "body": json.dumps({"error": "Errore interno"})
+            "statusCode": 400,
+            "body": json.dumps({"error": "Campi 'user' e 'message' sono obbligatori e message non vuoto"})
         }
+
+    # Se il client invia un parametro per livello o altre info, puoi estrarlo da body.
+    # Ma qui consideriamo che l'AI estragga solo il nome della skill. Eventualmente si può chiedere livello.
+    # Costruisco prompt per Gemini: chiedere estrazione di nuove skill apprese
+    prompt = (
+        "Analizza il seguente messaggio dell'utente. Se l'utente dichiara di aver appreso o migliorato "
+        "una o più skill, restituisci un JSON con:\n"
+        "  - action: \"learn_skill\" se c'è almeno una skill, altrimenti \"none\".\n"
+        "  - skills: lista di nomi di skill (stringhe), se action è \"learn_skill\".\n"
+        "\nEsempi di output:\n"
+        "  { \"action\": \"learn_skill\", \"skills\": [\"Python\"] }\n"
+        "  { \"action\": \"learn_skill\", \"skills\": [\"JavaScript\", \"SQL\"] }\n"
+        "  { \"action\": \"none\" }\n"
+        "\nNon includere altri campi. Restituisci solo il JSON puro.\n"
+        f"Testo da analizzare: \"{message}\""
+    )
+
+    ai_raw = None
+    extracted = {"action": "none"}
+    if gemini_client is None:
+        logger.warning("gemini_client non inizializzato, salto analisi AI.")
+    else:
+        try:
+            response = gemini_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                # eventualmente config: temperature, max_tokens, ecc.
+                temperature=0.3,
+                max_tokens=200
+            )
+            ai_text = response.text.strip()
+            ai_raw = ai_text
+            logger.info("Risposta AI raw: %s", ai_text)
+            # Provo a fare il parse JSON
+            try:
+                # Se l'AI aggiunge backticks o testo, potresti dover isolare il JSON: 
+                # qui assumiamo che l'AI restituisca esattamente un JSON valido
+                extracted = json.loads(ai_text)
+            except json.JSONDecodeError:
+                # Prova a estrarre parte che sembra JSON tra {...}
+                # Cerca la prima occorrenza di {...}
+                start = ai_text.find("{")
+                end = ai_text.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    snippet = ai_text[start:end+1]
+                    try:
+                        extracted = json.loads(snippet)
+                    except:
+                        logger.warning("Non sono riuscito a fare JSON.parse della risposta AI: %s", snippet)
+                        extracted = {"action": "none"}
+                else:
+                    logger.warning("Risposta AI non JSON decodable: %s", ai_text)
+                    extracted = {"action": "none"}
+        except Exception as e:
+            logger.error("Errore chiamata Gemini: %s", str(e))
+            # Potresti scegliere di ritornare errore 500, o proseguire senza salvare.
+            return {
+                "statusCode": 500,
+                "body": json.dumps({"error": "Errore durante analisi AI", "detail": str(e)})
+            }
+
+    # Ora, in base a extracted:
+    added = []
+    action = extracted.get("action")
+    if action == "learn_skill":
+        skills = extracted.get("skills")
+        if isinstance(skills, list):
+            for skill_name in skills:
+                # Filtro skill_name: deve essere stringa non vuota
+                if isinstance(skill_name, str) and skill_name.strip():
+                    skill_clean = skill_name.strip()
+                    # Costruisco item DynamoDB
+                    skill_id = str(uuid.uuid4())
+                    # Salvo data ISO o dd/mm/yyyy, come preferisci. Qui uso ISO
+                    acquired_on = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                    item = {
+                        "Skill_UID": skill_id,
+                        "user": user,
+                        "skill": skill_clean,
+                        "level": 1,  # default, o potresti chiedere all'AI di stimare un livello?
+                        "acquired_on": acquired_on,
+                        "source": "chat",
+                        "status": "done",
+                        # salvo raw response per debug
+                        "aiResponseRaw": ai_raw
+                    }
+                    try:
+                        table.put_item(Item=item)
+                        added.append({
+                            "Skill_UID": skill_id,
+                            "skill": skill_clean,
+                            "acquired_on": acquired_on
+                        })
+                    except ClientError as e:
+                        logger.error("Errore put_item chat_skill su skill %s: %s", skill_clean, e.response["Error"]["Message"])
+                        # Non interrompo il loop: continuo con le altre skill
+        else:
+            logger.warning("Campo 'skills' non lista: %s", skills)
+    else:
+        # action none o altro campo: non fare nulla
+        logger.info("Nessuna skill da salvare (action=%s)", action)
+
+    # Risposta HTTP
+    resp_body = {
+        "added": added, 
+        "message": None,
+        "aiRaw": ai_raw
+    }
+    if added:
+        resp_body["message"] = f"Aggiunte {len(added)} skill al diario."
+    else:
+        resp_body["message"] = "Non ho individuato nuove skill da salvare."
+    # Rimuovi aiRaw dalla response se non vuoi esporlo al client
+    return {
+        "statusCode": 200,
+        "body": json.dumps(resp_body)
+    }
