@@ -1,2 +1,8 @@
 boto3
-google-genai
+google-cloud-aiplatform
+google-auth
+requests
+
+
+
+arn:aws:iam::388592345191:user/a.simota
